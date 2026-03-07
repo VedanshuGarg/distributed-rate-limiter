@@ -4,6 +4,7 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 
 import java.time.Duration;
+import java.time.Instant;
 
 @Service
 public class RateLimiterService {
@@ -17,26 +18,33 @@ public class RateLimiterService {
         this.redisTemplate = redisTemplate;
     }
 
-    /**
-     * Checks if a client is allowed to make a request.
-     * @param clientId The IP address or API Key of the user
-     * @return true if allowed, false if blocked (Rate Limited)
-     */
     public boolean isAllowed(String clientId) {
-        String redisKey = "rate_limit:" + clientId;
+        String redisKey = "rate_limit:sliding:" + clientId;
 
-        Long currentRequests = redisTemplate.opsForValue().increment(redisKey);
+        long currentTimeMs = Instant.now().toEpochMilli();
+        long windowStartMs = currentTimeMs - (WINDOW_IN_SECONDS * 1000L);
 
-        if (currentRequests != null && currentRequests == 1) {
-            redisTemplate.expire(redisKey, Duration.ofSeconds(WINDOW_IN_SECONDS));
-        }
+        // 1. Clean up: Remove any timestamps that are older than our 60-second window
+        redisTemplate.opsForZSet().removeRangeByScore(redisKey, 0, windowStartMs);
 
-        if (currentRequests != null && currentRequests > MAX_REQUESTS_PER_MINUTE) {
-            System.out.println("BLOCKED: " + clientId + " exceeded rate limit!");
+        // 2. Count: How many requests has this user made in the current window?
+        Long currentRequests = redisTemplate.opsForZSet().zCard(redisKey);
+
+        // 3. Decide: Are they over the limit?
+        if (currentRequests != null && currentRequests >= MAX_REQUESTS_PER_MINUTE) {
+            System.out.println("🚨 BLOCKED: " + clientId + " exceeded sliding window limit!");
             return false;
         }
 
-        System.out.println("ALLOWED: " + clientId + " (Request " + currentRequests + " of " + MAX_REQUESTS_PER_MINUTE + ")");
+        // 4. Allowed! Add their new timestamp to the set
+        // We use the timestamp as both the value (needs to be a string) and the score (needs to be a double)
+        redisTemplate.opsForZSet().add(redisKey, String.valueOf(currentTimeMs), currentTimeMs);
+
+        // 5. Memory Management: Set the whole key to expire after 60 seconds of inactivity
+        // so we don't leak memory for users who leave the site.
+        redisTemplate.expire(redisKey, Duration.ofSeconds(WINDOW_IN_SECONDS));
+
+        System.out.println("ALLOWED: " + clientId + " (Request " + (currentRequests + 1) + " of " + MAX_REQUESTS_PER_MINUTE + ")");
         return true;
     }
 }
